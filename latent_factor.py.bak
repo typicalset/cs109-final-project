@@ -1,0 +1,192 @@
+__author__ = 'matthew'
+
+import numpy as np
+
+"""
+Function
+--------
+gamma_m_draw
+
+Draw a single sample from the conditional posterior distribution
+of gamma_m.
+
+Inputs
+-------
+X_m: A g-by-L+1 matrix, defined above.
+Y_m: A 1D vector of length g, defined above.
+sig2: Residual _variance_, as defined above.
+Lambda_gamma: Prior precision matrix.
+
+Outputs
+--------
+Single draw from conditional posterior, defined above.
+"""
+#Item-specific parameters given all else
+#your code here
+def gamma_m_draw(X_m, Y_m, sig2, Lambda_gamma):
+
+    #Compute matrices that define conditional posterior.
+    Q_m_inv = np.linalg.inv(np.dot(X_m.T, X_m)/sig2+Lambda_gamma)
+    XtY = np.dot(X_m.T, Y_m)
+
+    #Draw item-specific parameters.
+    return np.random.multivariate_normal(np.dot(Q_m_inv, XtY)/sig2, Q_m_inv)
+
+"""
+Function
+--------
+theta_u_draw
+
+Draw a single sample from the conditional posterior distribution
+of gamma_m.
+
+Inputs
+-------
+X_u: A g-by-L+1 matrix, defined above.
+Y_u: A 1D vector of length g, defined above.
+sig2: Residual _variance_, as defined above.
+Lambda_theta: Prior precision matrix.
+
+Outputs
+--------
+Single draw from conditional posterior, defined above.
+"""
+#User-specific parameters given all else
+#your code here
+def theta_u_draw(X_u, Y_u, sig2, Lambda_theta):
+    #Compute matrices that define conditional posterior.
+    Q_u_inv = np.linalg.inv(np.dot(X_u.T, X_u)/sig2+Lambda_theta)
+    XtY = np.dot(X_u.T, Y_u)
+
+    #Draw the user-specific parameters
+    return np.random.multivariate_normal(np.dot(Q_u_inv, XtY)/sig2, Q_u_inv)
+
+"""
+Function
+--------
+factor_gibbs
+
+Runs a gibbs sampler to infer mean, variance, user-specific, and item-specific
+parameters.
+
+Inputs
+-------
+data: A dataframe containing ratings data.
+L: Dimension of latent factors.
+maxit: Number of samples to draw from posterior.
+Lambda_theta_diag: Hyperparameter controlling regularization of Theta.
+Lambda_gamma_diag: Hyperparameter controlling regularization of Gamma.
+progress: if true, print iteration number every 100 iterations.
+
+Outputs
+--------
+Dictionary with elements
+mu: Draws of mu. 1D array of length maxiter.
+sig2: Draws of sig2, residual _variance_. 1D array of length maxiter.
+theta: Draws of Theta. U-by-L-by-maxiter array.
+gamma: Draws of Gamma. M-by-L-by-maxiter array.
+EY: Draws of fitted values of Y. N-by-maxiter array.
+"""
+def factor_gibbs(data, L, maxit, Lambda_theta_diag, Lambda_gamma_diag, progress=True):
+    data = data.copy()
+    data['dwell_time'] = np.log(data['dwell_time'])
+    N = data.shape[0]
+
+    #Create indices that allow us to map users and restaurants to rows
+    #in parameter vectors.
+    uusers, uidx = np.unique(data.user_id, return_inverse=True)
+    uitems, midx = np.unique(data.url_id, return_inverse=True)
+
+    nusers = uusers.size
+    nitems = uitems.size
+
+    #Add numerical indices to dataframe.
+    data["uidx"] = uidx
+    data["midx"] = midx
+
+    #Group observations by user and by business.
+    ugroups = data.groupby("uidx")
+    mgroups = data.groupby("midx")
+
+    all_avg = data.dwell_time.mean()
+    u_avg = ugroups.dwell_time.mean()
+    m_avg = mgroups.dwell_time.mean()
+
+    #Initialize parameters and set up data structures for
+    #holding draws.
+    #Overall mean
+    mu = all_avg
+    mu_draws = np.zeros(maxit)
+    #Residual variance
+    sig2 = 1.8
+    sig2_draws = np.zeros(maxit)
+
+    #Matrix of user-specific bias and L latent factors.
+    theta = np.zeros([nusers, L+1])
+    theta[:,0] = u_avg-all_avg
+    theta_draws = np.zeros([nusers, L+1, maxit])
+
+    #Matrix of item-specific bias and L latent factors.
+    gamma = np.zeros([nitems, L+1])
+    gamma[:,0] = m_avg-all_avg
+    gamma_draws = np.zeros([nitems, L+1, maxit])
+
+    #Matrix for holding the expected number of stars
+    #for each observation at each draw from the posterior.
+    EY_draws = np.zeros([data.shape[0], maxit])
+
+    #Inverse covariance matrices from the prior on each theta_u
+    #and gamma_b. These are diagonal, like Ridge regression.
+    Lambda_theta = np.eye(L+1)*Lambda_theta_diag
+    Lambda_gamma = np.eye(L+1)*Lambda_gamma_diag
+
+    #Main sampler code
+    for i in range(maxit):
+        if i%100==0 and progress:
+            print i
+
+        #The entire regression equation except for the overall mean.
+        nomu = np.sum(theta[data.uidx,1:]*gamma[data.midx,1:], axis=1) +\
+                  theta[data.uidx,0] + gamma[data.midx,0]
+
+        #Compute the expectation of each observation given the current
+        #parameter values.
+        EY_draws[:,i]=mu+nomu
+
+        #Draw overall mean from a normal distribution
+        mu = np.random.normal(np.mean(data.dwell_time-nomu), np.sqrt(sig2/N))
+        #Draw overall residual variance from a scaled inverse-Chi squared distribution.
+        sig2 = np.sum(np.power(data.dwell_time-nomu-mu,2))/np.random.chisquare(N-2)
+
+        #For each item
+        for mi,itemdf in mgroups:
+            #Gather relevant observations, and subtract out overall mean and
+            #user-specific biases, which we are holding fixed.
+            Y_m = itemdf.dwell_time-mu-theta[itemdf.uidx,0]
+            #Build the regression design matrix implied by holding user factors
+            #fixed.
+            X_m = np.hstack((np.ones([itemdf.shape[0],1]),
+                             theta[itemdf.uidx,1:]))
+            gamma[mi,:] = gamma_m_draw(X_m, Y_m, sig2, Lambda_gamma)
+
+        #For each user
+        for ui,userdf in ugroups:
+            #Gather relevant observations, and subtract out overall mean and
+            #business-specific biases, which we are holding fixed.
+            Y_u = userdf.dwell_time-mu-gamma[userdf.midx,0]
+            #Build the regression design matrix implied by holding business factors
+            #fixed.
+            X_u = np.hstack((np.ones([userdf.shape[0],1]),
+                             gamma[userdf.midx,1:]))
+
+            theta[ui,:] = theta_u_draw(X_u, Y_u, sig2, Lambda_theta)
+
+        #Record draws
+        mu_draws[i] = mu
+        sig2_draws[i] = sig2
+        theta_draws[:,:,i] = theta
+        gamma_draws[:,:,i] = gamma
+
+    return {"mu": mu_draws, "sig2": sig2_draws,
+            "theta": theta_draws, "gamma": gamma_draws,
+            "EY": EY_draws}
